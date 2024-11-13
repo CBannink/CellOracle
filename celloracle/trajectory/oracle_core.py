@@ -109,6 +109,7 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
         self.cluster_specific_TFdict = None
         self.cv_mean_selected_genes = None
         self.TFdict = {}
+        self.save_simulated_counts=None
 
     ############################
     ### 0. utility functions ###
@@ -866,6 +867,13 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
         #  simulated future gene expression matrix
         self.adata.layers["simulated_count"] = gem_simulated.values
 
+        if(self.save_simulated_counts ==None):
+            self.save_simulated_counts = []
+
+        simulated_frame_with_perturb_dict = (gem_simulated.values, perturb_condition.copy())
+        self.save_simulated_counts.append(simulated_frame_with_perturb_dict)
+
+
         #  difference between simulated values and original values
         self.adata.layers["delta_X"] = self.adata.layers["simulated_count"] - self.adata.layers["imputed_count"]
 
@@ -883,6 +891,9 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
                 message = f"There may be out of distribution prediction in {len(ood_stat)} genes. It is recommended to set `clip_delta_X=True` to avoid the out of distribution prediction."
                 message += "\n To see the detail, please run `oracle.evaluate_simulated_gene_distribution_range()`"
                 warnings.warn(message, UserWarning, stacklevel=2)
+
+    def _get_simulated_states_and_perturb_conditions_bulk(selfs) -> List:
+        return selfs.save_simulated_counts
 
     def _clear_simulation_results(self):
         att_list = ["flow_embedding", "flow_grid", "flow", "flow_norm_magnitude",
