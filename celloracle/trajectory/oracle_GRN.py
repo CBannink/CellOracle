@@ -37,6 +37,14 @@ def _do_simulation(coef_matrix, simulation_input, gem, n_propagation):
     """
     delta_input = simulation_input - gem
 
+    #delta input is n_cells x n_genes and coef_matrix is n_genes x n_genes
+    #for entry coef_matrix (i,j) means the weight of gene j on gene i, how does j influence i
+    #the dot product will result in a matrix with shape n_cells x n_genes
+    #so for a single entry in delta_input, lets say genes a,b with coef matrix aa,ab ba,bb this will result in a correct multiplied matrix of:
+    #a*aa+b*ab, a*ba+b*bb  so the change of gene a in the end result is determined by the influence of gene a and b on gene a
+    #so if we have delta_input = [1,0] and coef_matrix = [[1,2],[2,1]] (meaning gene 1 influences gene 0 and gene 0 influences gene 1) the result will be [1*1+0*2,1*2+0*1] = [1,2]
+    #meaning taking simple the dot product will correctly calculate the effects of a shift (as we take the delta)
+
     delta_simulated = delta_input.copy()
     for i in range(n_propagation):
         delta_simulated = delta_simulated.dot(coef_matrix)
