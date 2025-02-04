@@ -259,6 +259,74 @@ class modified_VelocytoLoom():
         self.k_knn_imputation = k
 
 
+    def estimate_transition_prob_subset(self,
+                                        X: pd.DataFrame,
+                                        delta_X: pd.DataFrame,
+                                        threads: int = None,
+                                        calculate_randomized: bool = False,
+                                        random_seed: int = 15071990) -> None:
+        """
+        Estimate transition probabilities for a primary cell and all its neighbors.
+        Assumes that X and delta_X are already subsetted with the primary cell in row 0 and all neighbor cells in subsequent rows.
+
+        Instead of randomly sampling a fraction of neighbors, this version uses all provided neighbors.
+        It computes correlations via colDeltaCorpartial, which accepts the full matrices and a neighbor indices array.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Original gene expression matrix for the primary cell and its neighbors.
+        delta_X : np.ndarray
+            Expression shift (delta) matrix for the primary cell and its neighbors.
+            The first row corresponds to the primary cell.
+        threads : int, optional
+            Number of threads to be used in colDeltaCorpartial.
+        calculate_randomized : bool, default True
+            If True, also compute the randomized (negative-control) transition probabilities.
+        random_seed : int, default 15071990
+            Seed for reproducibility.
+        sigma_corr : float, default 0.05
+            Scaling parameter in the exponential kernel for converting correlation coefficients into weights.
+
+        Sets
+        ----
+        self.transition_prob_subset : np.ndarray
+            The normalized transition probability vector computed over all neighbors.
+        self.transition_prob_random_subset : np.ndarray or None
+            The normalized randomized transition probability vector (if calculate_randomized is True).
+        """
+        np.random.seed(random_seed)
+
+        # Ensure there are neighbors (more than one row)
+        n_total = delta_X.shape[0]
+        if n_total < 2:
+            logging.warning("No neighbors provided; cannot compute transition probabilities.")
+            raise ValueError("No neighbors provided; cannot compute transition probabilities.")
+
+
+        if "pca_neighbors_sparse" not in X.obsm:
+            raise ValueError("Please run calculate_pca_vector_shift first")
+        # All neighbor cell indices (neighbors occupy rows 1 through n_total-1)
+
+        neigh_ixs = np.arange(1, n_total)
+        self.embedding_knn = X.obsm["pca_neighbors_sparse"]
+        # Compute the correlation coefficients using the original matrices and neighbor indices.
+        self.corrcoef = colDeltaCorpartial(X, delta_X, neigh_ixs, threads=threads)
+
+        if np.any(np.isnan(self.corrcoef)):
+            self.corrcoef[np.isnan(self.corrcoef)] = 1
+            print("nan encountered")
+        if not calculate_randomized:
+            return
+        delta_X_random = np.copy(delta_X)
+        permute_rows_nsign(delta_X_random)  # This function is assumed to be defined in your codebase.
+        self.corrcoef_random = colDeltaCorpartial(X, delta_X_random, neigh_ixs, threads=threads)
+        #as it is reshuffled, we have to set a diagonal line to zero as it is the correlation with itself otherwise (there is a chance that this happens)
+        np.fill_diagonal(self.corrcoef_random, 0)
+        if np.any(np.isnan(self.corrcoef_random)):
+            self.corrcoef_random[np.isnan(self.corrcoef_random)] = 1
+            print("nan encountered for random")
+
     def estimate_transition_prob(self,
                                  n_neighbors: int=None,
                                  knn_random: bool=True, sampled_fraction: float=0.3,
@@ -400,7 +468,7 @@ class modified_VelocytoLoom():
             if calculate_randomized:
                 np.fill_diagonal(self.corrcoef_random, 0)
 
-    def calculate_embedding_shift(self, sigma_corr: float=0.05) -> None:
+    def calculate_embedding_shift(self, sigma_corr: float=0.05) -> np.ndarray:
         """Use the transition probability to project the velocity direction on the embedding
 
         Arguments
@@ -439,10 +507,13 @@ class modified_VelocytoLoom():
         self.delta_embedding = self.delta_embedding.T
 
 
+
         if hasattr(self, "corrcoef_random"):
             self.delta_embedding_random = (self.transition_prob_random * unitary_vectors).sum(2)
             self.delta_embedding_random -= (self.embedding_knn.toarray() * unitary_vectors).sum(2) / self.embedding_knn.sum(1).A.T
             self.delta_embedding_random = self.delta_embedding_random.T
+
+        return self.delta_embedding
 
 
     def calculate_grid_arrows(self, smooth: float=0.5, steps: Tuple=(40, 40),

@@ -12,6 +12,9 @@ import pandas as pd
 import scanpy as sc
 import seaborn as sns
 from tqdm.auto import tqdm
+from sklearn.neighbors import KDTree
+
+from sklearn.decomposition import PCA
 
 from ..utility.hdf5_processing import dump_hdf5, load_hdf5
 
@@ -527,6 +530,90 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
                                                   return_as="dict")
         self.colorandum = np.array([col_dict[i] for i in self.adata.obs[self.cluster_column_name]])
 
+
+    def _precompute_PCA_embedding(self, n_components=50):
+        """
+        Computes PCA embedding for the AnnData object.
+        The PCA embedding is stored in adata.obsm['X_pca'].
+
+        Parameters
+        ----------
+        n_components: int
+            Number of PCA components to compute.
+        """
+        # Run PCA (if not already computed)
+        if "X_pca" not in self.adata.obsm:
+            sc.tl.pca(self.adata, n_comps=n_components, svd_solver='arpack')
+
+    def precompute_pca_neighbors(self, n_neighbors = 500):
+        """
+           Precomputes and stores 500 PCA neighbors for all cells in adata.
+           Results are saved in adata.uns["pca_neighbors"].
+           """
+        # 1. make sure its computed
+        self._precompute_PCA_embedding(n_components=50)
+
+        # 2. Compute KNN graph in PCA space (+1 to account for self)
+        sc.pp.neighbors(self.adata, n_neighbors=n_neighbors + 1, use_rep="X_pca")
+
+        # 3. Extract neighbor indices (skip self-references)
+        neighbor_indices = self.adata.uns["neighbors"]["indices"]
+        neighbor_indices = np.array([row[1:] if row[0] == i else row[:-1]
+                                     for i, row in enumerate(neighbor_indices)])
+
+        # 4. Store in adata.uns for fast lookup
+        self.adata.obsm["pca_neighbors"] = neighbor_indices
+
+        # 5. save it as a sparse matrix as well (recalc just easi only done once)
+        knn = NearestNeighbors(n_neighbors=n_neighbors + 1, n_jobs=-1)
+        knn.fit(self.adata.obsm["X_pca"])
+        sparse_matrix = knn.kneighbors_graph(mode="connectivity")
+        self.adata.uns["pca_neighbors_sparse"] = sparse_matrix
+        self.adata.obsm["pca_neighbors_sparse"] = sparse_matrix
+
+        # 6 Start the process for 1 neighbors
+        if "PCs" not in self.adata.varm:
+            raise ValueError("PCs are missing. Cannot compute PCA transformer.")
+        pca = PCA(n_components=50)
+        pca.components_ = self.adata.varm["PCs"]
+        self._pca_transformer = pca
+
+        # 6. Prepare a cached KDTree built on the PCA embedding from adata
+        self._pca_kdtree = KDTree(self.adata.obsm["X_pca"])
+
+
+
+    def get_pca_neighbors(self, cell_ix):
+        """
+        Retrieve precomputed nearest neighbors for a given cell index.
+        """
+        if "pca_neighbors" not in self.adata.uns:
+            self.precompute_pca_neighbors()
+        return self.adata.uns["pca_neighbors"][cell_ix]
+
+    def get_post_perturb_nn(self, post_perturb_cell_state):
+        """
+        Finds the closest existing cell in PCA space for a *new* cell state.
+        Returns index of the nearest neighbor in adata.
+        """
+        # 1. Retrieve PCA model and embedding
+        if "X_pca" not in self.adata.obsm:
+            raise ValueError("PCA embedding is missing. Cannot compute nearest neighbor.")
+
+        if not hasattr(self, "_pca_transformer") or self._pca_transformer is None:
+            raise ValueError("PCA transformer is missing. Cannot compute nearest neighbor.")
+
+        if not hasattr(self, "_pca_kdtree") or self._pca_kdtree is None:
+            raise ValueError("PCA KDTree is missing. Cannot compute nearest neighbor.")
+        #check if reshaping is needed
+        if len(post_perturb_cell_state.shape) == 1:
+            print("reshape")
+            post_perturb_cell_state = post_perturb_cell_state.reshape(1, -1)
+        new_pca = self._pca_transformer.transform(post_perturb_cell_state)
+        # 4. Query the KDTree for the nearest neighbor (k=1)
+        dist, ind = self._pca_kdtree.query(new_pca, k=1)
+        return ind[0][0]
+
     ####################################
     ### 2. Methods for GRN inference ###
     ####################################
@@ -759,7 +846,7 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
         # 1. prepare perturb information
 
 
-        self.perturb_condition = perturb_condition.copy()
+        perturb_condition.copy()
 
 
         # Prepare metadata before simulation
@@ -851,7 +938,6 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
                 cells_in_the_cluster_bool = (cluster_info == cluster)
                 simulation_input_ = simulation_input[cells_in_the_cluster_bool]
                 gem_ = gem_imputed[cells_in_the_cluster_bool]
-
                 simulated_in_the_cluster = _do_simulation(
                                              coef_matrix=coef_matrix,
                                              simulation_input=simulation_input_,
@@ -894,72 +980,54 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
                 message += "\n To see the detail, please run `oracle.evaluate_simulated_gene_distribution_range()`"
                 warnings.warn(message, UserWarning, stacklevel=2)
 
-    def _get_simulated_states_and_perturb_conditions_bulk(self) -> List:
-        return self.save_simulated_counts
 
-    def simulate_shift_with_cell_state_input(self, cell_state=None, perturb_condition=None, GRN_unit=None,
-                                             GRN_cluster=None, n_propagation=3, ignore_warning=False,
-                                             clip_delta_X=False):
+    def training_phase_inference(self, perturb_condition, idx, n_propagation, n_min=None,n_max=None,clip_delta_X=False, sigma_corr=0.05, threads = 4, calc_random=False) -> int :
+        """This function does everything required for inference during training
+            Step 1: Get pca neighbors (500) for the idx
+            Step 2: Perform shift for the idx and its neighbors using simulate_shift_subset
+            Step 3: Calculate the transition probabilities for the primary idx and its neighbors? or only for primary idx based on neighbors, not sure
+            Step 4: Calculate the vector shift in the PCA embedding space (if possible) for the primary idx based on its neighbors
+            Step 5: Calculate the new PCA embedding for the primary idx based on the shift vector
+            Step 6: Return the cell in our data closest to the new PCA embedding of the primary idx
+
+            RETURNS: The index of the cell in our data that is closest to the new PCA embedding of the primary idx"""
+
+        neighbor_idxs = self.get_pca_neighbors(idx)
+        all_idx = np.concatenate(([idx], neighbor_idxs))
+        simulated_states = self.simulate_shift_subset(perturb_condition, GRN_unit="cluster", subset_idx=all_idx,n_propagation=n_propagation,n_min=n_min,n_max=n_max,clip_delta_X=clip_delta_X)
+        self.estimate_transition_prob_subset(self.adata[all_idx], simulated_states, calculate_randomized=calc_random, threads=threads)
+        shift_in_embedding = self.calculate_embedding_shift(sigma_corr=sigma_corr)
+        print("embedding shift shape: " + str(shift_in_embedding.shape))
+        if shift_in_embedding.shape[0] > 1:
+            primary_cell_shift = shift_in_embedding[0]
+        else:
+            primary_cell_shift = shift_in_embedding
+        new_pca = self.adata.obsm["X_pca"][idx] + primary_cell_shift
+        return self.get_post_perturb_nn(new_pca)
+
+
+    def simulate_shift_subset(self, perturb_condition, GRN_unit, subset_idx,
+                              n_propagation=3, ignore_warning=False,use_randomized_GRN=False, n_min=None,n_max=None,clip_delta_X=False ) -> pd.DataFrame:
         """
-        Simulate signal propagation with GRNs. Please see the CellOracle paper for details.
-        This function simulates a gene expression pattern in the near future.
-        Simulated values will be stored in anndata.layers: ["simulated_count"]
+        Simulate signal propagation (that is, a future gene expression shift) on a specified subset of cells.
 
-        The simulation use three types of data.
-        (1) GRN inference results (coef_matrix).
-        (2) Perturb_condition: You can set arbitrary perturbation condition.
-        (3) Gene expression row with which it is modified.
+        Rather than using the entire self.adata, the simulation will be performed only on the primary cell
+        (row index: primary_idx) and on its neighbors (row indices: neighbor_idxs). The method applies the standard
+        perturbation procedure but only on the supplied subset.
 
-        Args:
-            perturb_condition (dictionary): condition for perturbation.
-               if you want to simulate knockout for GeneX, please set [perturb_condition={"GeneX": 0.0}]
-               Although you can set any non-negative values for the gene condition, avoid setting biologically
-           cell_state (pandas.DataFrame): Gene expression row with which it is modified.
-           GRN_cluster (str): Cluster name for which the simulation is performed.
+        Arguments:
+            perturb_condition (dict): The desired perturbation. For example {"GeneX": 0.0}
+            GRN_unit (str): Either "whole" or "cluster"; see fit_GRN_for_simulation for details.
+            primary_idx (int): Row index in self.adata corresponding to the cell state of primary interest.
+            neighbor_idxs (array-like): Array or list of row indices corresponding to neighbor cells.
+            n_propagation (int): Number of iterations for GRN signal propagation (default: 3).
+            use_randomized_GRN (bool): Whether to use the randomized GRN For negative control.
+            clip_delta_X (bool): Whether to clip any simulated gene expression values outside the wild‐type range.
 
-       """
-        if cell_state is None:
-            raise ValueError("Please set cell_state parameter.")
-        if GRN_cluster is None:
-            raise ValueError("Please set GRN_cluster parameter.")
-        if GRN_unit is None:
-            # force to use cluster unit
-            GRN_unit = "cluster"
-
-
-    def __simulate_shift_with_cell_state_input(self, cell_state=None,perturb_condition=None, GRN_unit=None, GRN_cluster=None,
-                       n_propagation=3, ignore_warning=False, n_min=None, n_max=None, clip_delta_X=False):
-
-        #test this function, it will (hopefully) work here?
+        Side Effects:
+            Writes the simulated expression values to a new layer "simulated_count_subset" in self.adata.
+            The delta (shift) is stored in self.adata.layers["delta_X_subset"].
         """
-        Simulate signal propagation with GRNs. Please see the CellOracle paper for details.
-        This function simulates a gene expression pattern in the near future.
-        Simulated values will be stored in anndata.layers: ["simulated_count"]
-
-
-        The simulation use three types of data.
-        (1) GRN inference results (coef_matrix).
-        (2) Perturb_condition: You can set arbitrary perturbation condition.
-        (3) Gene expression matrix: The simulation starts from imputed gene expression data.
-
-        Args:
-            perturb_condition (dictionary): condition for perturbation.
-               if you want to simulate knockout for GeneX, please set [perturb_condition={"GeneX": 0.0}]
-               Although you can set any non-negative values for the gene condition, avoid setting biologically infeasible values for the perturb condition.
-               It is strongly recommended to check gene expression values in your data before selecting the perturb condition.
-
-            GRN_unit (str): GRN type. Please select either "whole" or "cluster". See the documentation of "fit_GRN_for_simulation" for the detailed explanation.
-
-            n_propagation (int): Calculation will be performed iteratively to simulate signal propagation in GRN.
-                You can set the number of steps for this calculation.
-                With a higher number, the results may recapitulate signal propagation for many genes.
-                However, a higher number of propagation may cause more error/noise.
-        """
-        if cell_state==None:
-            raise ValueError("Please set cell_state parameter.")
-        if not isinstance(cell_state, pd.DataFrame):
-            raise ValueError("cell_state should be a pandas dataframe.")
-
         if n_min is None:
             n_min = CONFIG["N_PROP_MIN"]
         if n_max is None:
@@ -980,8 +1048,12 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
         else:
             raise ValueError("GRN is not ready. Please run 'fit_GRN_for_simulation' first.")
 
+        if use_randomized_GRN:
+            print("Attention: Using randomized GRN for the perturbation simulation.")
 
         # 1. prepare perturb information
+
+
         self.perturb_condition = perturb_condition.copy()
 
 
@@ -992,129 +1064,302 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
         if not hasattr(self, "all_regulatory_genes_in_TFdict"):
             self._process_TFdict_metadata()
 
-        for i, value in perturb_condition.items():
-            # 1st Sanity check
-            if not i in self.adata.var.index:
-                raise ValueError(f"Gene {i} is not included in the Gene expression matrix.")
 
-            # 2nd Sanity check
-            if i not in self.all_regulatory_genes_in_TFdict:
-                raise ValueError(f"Gene {i} is not included in the base GRN; It is not TF or TF motif information is not available. Cannot perform simulation.")
+        # 2. Extract the imputed gene expression matrix for these cells.
+        #    (Assume self.adata.layers["imputed_count"] is an array-like of shape (ncells, ngenes).)
 
-            # 3rd Sanity check
-            if i not in self.active_regulatory_genes:
-                raise ValueError(f"Gene {i} does not have enough regulatory connection in the GRNs. Cannot perform simulation.")
+        subset_adata = self.adata[subset_idx]
+        #_adata_to_df already makes copy of the data
+        simulation_input_subset = _adata_to_df(subset_adata.layers["imputed_count"])
 
-            # 4th Sanity check
-            if i not in self.high_var_genes:
-                if ignore_warning:
-                    pass
-                    #print(f"Variability score of Gene {i} is too low. Simulation accuracy may be poor with this gene.")
-                else:
-                    pass
-                    #print(f"Variability score of Gene {i} is too low. Simulation accuracy may be poor with this gene.")
-                    #raise ValueError(f"Variability score of Gene {i} is too low. Cannot perform simulation.")
+        for gene, value in perturb_condition.items():
+            if gene not in simulation_input_subset.columns:
+                print(f"Gene {gene} is not in the subset. Skipping perturbation.")
+                continue
+            simulation_input_subset[gene] = value  # set perturbation on entire subset
 
-            # 5th Sanity check
-            if value < 0:
-                raise ValueError(f"Negative gene expression value is not allowed.")
+        gem_imputed_subset = _adata_to_df(subset_adata, "imputed_count")
+        # 4. For each gene perturbed, set every cell in the subset to the specified perturbation value.
+        #    (Typically, one perturbs one TF, but this code supports multiple keys.)
+        #    We assume that the columns in simulation_input are labelled by gene names in self.adata.var.index.
+        #    If simulation_input is a DataFrame use .loc; if it is a numpy array then assume a separate lookup.
+        #    For demonstration, here we assume simulation_input is a DataFrame.
 
-            # 6th Sanity check
-            safe = _is_perturb_condition_valid(adata=self.adata,
-                                        goi=i, value=value, safe_range_fold=2)
-            if not safe:
-                if ignore_warning:
-                    pass
-                else:
-                    raise ValueError(f"Input perturbation condition is far from actural gene expression value. Please follow the recommended usage. ")
-            # 7th QC
-            if n_min <= n_propagation <= n_max:
-                pass
+        # 5. Retrieve the GRN coefficient matrices for the subset.
+
+        coef_matrix_list = {}
+        if GRN_unit == "whole":
+            if use_randomized_GRN:
+                if not hasattr(self, "coef_matrix_randomized"):
+                    self.calculate_randomized_coef_table()
+                coef_matrix = self.coef_matrix_randomized.copy()
             else:
-                raise ValueError(f'n_propagation value error. It should be an integer from {n_min} to {n_max}.')
-
-        #To my current understanding, adata.layers["simulated_count"] is not used throughout the code only to reset and adjust based on perturb condition and convert directly to a dataframe (not necessary to store as global var)
-        #We will not use this as we receive a dataframe directly from the input to perturb.
-        # reset simulation initiation point
-        ############# OLD CODE ################
-        # self.adata.layers["simulation_input"] = self.adata.layers["imputed_count"].copy()
-        # simulation_input = _adata_to_df(self.adata, "simulation_input")
-        # for i in perturb_condition.keys():
-        #     simulation_input[i] = perturb_condition[i]
-        ############# OLD CODE ################
-
-        # 2. load gene expression matrix (initiation information for the simulation)
-        #retrieving the original data is again not necessary as we only want to operate on a single cell state
-
-        ############# OLD CODE ################
-        # gem_imputed = _adata_to_df(self.adata, "imputed_count")
-        # simulated = []
-        # cluster_info = self.adata.obs[self.cluster_column_name]
-        ############# OLD CODE ################
-
-        ############# NEW CODE ################
-        gem_imputed = cell_state.copy()
-        simulation_input = cell_state.copy()
-        for i in perturb_condition.keys():
-            simulation_input[i] = perturb_condition[i]
-        ############# NEW CODE ################
-
-
-
-        if self.coef_matrix_per_cluster.__contains__(GRN_cluster)==False:
-            raise ValueError(f"GRN cluster {GRN_cluster} does not exist. Please run 'fit_GRN_for_simulation' first.")
-
-        cluster_specific_coef_matrix =  self.coef_matrix_per_cluster[GRN_cluster].copy()
-        #code that convert gem_imputed and simulation_input to a shape of 1, n_genes if the shape is n_genes,
-        if gem_imputed.shape != (1,cluster_specific_coef_matrix.shape[0]):
-            gem_imputed = gem_imputed.reshape(1,-1)
-        if simulation_input.shape != (1,cluster_specific_coef_matrix.shape[0]):
-            simulation_input = simulation_input.reshape(1,-1)
-        #make sure its 1,n_genes shape both simulated and gem as it is necessary to correctly perform the _do_simulation function
-        gem_simulated = _do_simulation(coef_matrix=cluster_specific_coef_matrix,simulation_input=simulation_input,gem=gem_imputed,n_propagation=n_propagation)
-
-        ############# OLD CODE ################
-        # for cluster in np.unique(cluster_info):
-        #     coef_matrix = self.coef_matrix_per_cluster[cluster].copy()
-        #     cells_in_the_cluster_bool = (cluster_info == cluster)
-        #     simulation_input_ = simulation_input[cells_in_the_cluster_bool]
-        #     gem_ = gem_imputed[cells_in_the_cluster_bool]
-        #     simulated.append(simulated_in_the_cluster)
-        # gem_simulated = pd.concat(simulated, axis=0)
-        # gem_simulated = gem_simulated.reindex(gem_imputed.index)
-        ############# OLD CODE ################
-
-
-
-
-        # 4. store simulation results
-        #  simulated future gene expression matrix
-        self.adata.layers["simulated_count"] = gem_simulated.values
-
-        if(self.save_simulated_counts_single ==None):
-            self.save_simulated_counts_single = []
-
-        simulated_frame_with_perturb_dict = (gem_simulated.values, perturb_condition.copy())
-        self.save_simulated_counts_single.append(simulated_frame_with_perturb_dict)
-
-
-        #  difference between simulated values and original values
-        self.adata.layers["delta_X"] = self.adata.layers["simulated_count"] - self.adata.layers["imputed_count"]
-
-        # Clip simulated gene expression to avoid out of distribution prediction.
-        if clip_delta_X:
-            self.clip_delta_X()
-
-        # Sanity check; check distribution of simulated values. If the value is far from original gene expression range, it will give warning.
-        if ignore_warning:
-            pass
+                coef_matrix = self.coef_matrix.copy()
+            coef_matrix_list["whole"] = coef_matrix
+        elif GRN_unit == "cluster":
+            # For cluster-specific GRNs, assume self.coef_matrix_per_cluster is available;
+            # here we extract the matrix for the cluster corresponding to the primary_idx.
+            cluster_labels = self.adata.obs.loc[subset_idx, self.cluster_column_name].unique()
+            for cluster_label in cluster_labels:
+                if use_randomized_GRN:
+                    if not hasattr(self, "coef_matrix_per_cluster_randomized"):
+                        self.calculate_randomized_coef_table()
+                    coef_matrix = self.coef_matrix_per_cluster_randomized[cluster_label].copy()
+                else:
+                    coef_matrix = self.coef_matrix_per_cluster[cluster_label].copy()
+                coef_matrix_list[cluster_label] = coef_matrix
         else:
-            ood_stat = self.evaluate_simulated_gene_distribution_range()
-            ood_stat = ood_stat[ood_stat.Max_exceeding_ratio > CONFIG["OOD_WARNING_EXCEEDING_PERCENTAGE"]/100]
-            if len(ood_stat)> 0:
-                message = f"There may be out of distribution prediction in {len(ood_stat)} genes. It is recommended to set `clip_delta_X=True` to avoid the out of distribution prediction."
-                message += "\n To see the detail, please run `oracle.evaluate_simulated_gene_distribution_range()`"
-                warnings.warn(message, UserWarning, stacklevel=2)
+            raise ValueError("GRN_unit should be either 'whole' or 'cluster'.")
+
+        # 6. Call the simulation routine on the subset.
+        #    _do_simulation is expected to accept:
+        #         coef_matrix, simulation_input (DataFrame), and the original gem_imputed_subset (DataFrame) along with the propagation count.
+
+        simulated_data = []
+        for cluster_label, cluster_GRN in coef_matrix_list.items():
+            cells_in_cluster_bool = subset_adata.obs[self.cluster_column_name] == cluster_label
+            simulation_input_   = simulation_input_subset[cells_in_cluster_bool]
+            gem_imputed_        = gem_imputed_subset[cells_in_cluster_bool]
+            gem_simulated_subset = _do_simulation(coef_matrix=cluster_GRN,
+                                                  simulation_input=simulation_input_,
+                                                  gem=gem_imputed_,
+                                                  n_propagation=n_propagation)
+            simulated_data.append(gem_simulated_subset)
+
+        result_sim = pd.concat(simulated_data, axis=0)
+
+        # not sure if this is necessary, might have a different approach
+        # # 7. Store the simulated counts and the delta (difference) in new layers for the subset.
+        # self.adata.layers["simulated_count_subset"] = np.zeros_like(self.adata.layers["imputed_count"])
+        # self.adata.layers["delta_X_subset"] = np.zeros_like(self.adata.layers["imputed_count"])
+        #
+        # # Only update the rows corresponding to subset_idx.
+        # self.adata.layers["simulated_count_subset"][subset_idx] = gem_simulated_subset.values
+        # self.adata.layers["delta_X_subset"][subset_idx] = gem_simulated_subset.values - gem_imputed_subset
+
+        # 8. Optionally clip out-of-distribution predictions.
+        if clip_delta_X:
+            #check if this works
+            self.clip_delta_X_subset(result_sim, gem_imputed_subset)
+
+        return result_sim
+
+
+    def _get_simulated_states_and_perturb_conditions_bulk(self) -> List:
+        return self.save_simulated_counts
+
+    # def simulate_shift_with_cell_state_input(self, cell_state=None, perturb_condition=None, GRN_unit=None,
+    #                                          GRN_cluster=None, n_propagation=3, ignore_warning=False,
+    #                                          clip_delta_X=False) -> pd.DataFrame:
+    #     """
+    #     Simulate signal propagation with GRNs. Please see the CellOracle paper for details.
+    #     This function simulates a gene expression pattern in the near future.
+    #     Simulated values will be stored in anndata.layers: ["simulated_count"]
+    #
+    #     The simulation use three types of data.
+    #     (1) GRN inference results (coef_matrix).
+    #     (2) Perturb_condition: You can set arbitrary perturbation condition.
+    #     (3) Gene expression row with which it is modified.
+    #
+    #     Args:
+    #         perturb_condition (dictionary): condition for perturbation.
+    #            if you want to simulate knockout for GeneX, please set [perturb_condition={"GeneX": 0.0}]
+    #            Although you can set any non-negative values for the gene condition, avoid setting biologically
+    #        cell_state (pandas.DataFrame): Gene expression row with which it is modified.
+    #        GRN_cluster (str): Cluster name for which the simulation is performed.
+    #
+    #    """
+    #     return self.__simulate_shift_with_cell_state_input(cell_state=cell_state ,perturb_condition=perturb_condition,GRN_unit=GRN_unit,GRN_cluster=GRN_cluster,n_propagation=n_propagation,ignore_warning=ignore_warning,clip_delta_X=clip_delta_X)
+    #
+    #
+    # def __simulate_shift_with_cell_state_input(self, cell_state=None,perturb_condition=None, GRN_unit=None, GRN_cluster=None,
+    #                    n_propagation=3, ignore_warning=False, n_min=None, n_max=None, clip_delta_X=False) ->pd.DataFrame:
+    #
+    #     #test this function, it will (hopefully) work here?
+    #     """
+    #     Simulate signal propagation with GRNs. Please see the CellOracle paper for details.
+    #     This function simulates a gene expression pattern in the near future.
+    #     Simulated values will be stored in anndata.layers: ["simulated_count"]
+    #
+    #
+    #     The simulation use three types of data.
+    #     (1) GRN inference results (coef_matrix).
+    #     (2) Perturb_condition: You can set arbitrary perturbation condition.
+    #     (3) Gene expression matrix: The simulation starts from imputed gene expression data.
+    #
+    #     Args:
+    #         perturb_condition (dictionary): condition for perturbation.
+    #            if you want to simulate knockout for GeneX, please set [perturb_condition={"GeneX": 0.0}]
+    #            Although you can set any non-negative values for the gene condition, avoid setting biologically infeasible values for the perturb condition.
+    #            It is strongly recommended to check gene expression values in your data before selecting the perturb condition.
+    #
+    #         GRN_unit (str): GRN type. Please select either "whole" or "cluster". See the documentation of "fit_GRN_for_simulation" for the detailed explanation.
+    #
+    #         n_propagation (int): Calculation will be performed iteratively to simulate signal propagation in GRN.
+    #             You can set the number of steps for this calculation.
+    #             With a higher number, the results may recapitulate signal propagation for many genes.
+    #             However, a higher number of propagation may cause more error/noise.
+    #     """
+    #     if cell_state==None:
+    #         raise ValueError("Please set cell_state parameter.")
+    #     if not isinstance(cell_state, pd.DataFrame):
+    #         raise ValueError("cell_state should be a pandas dataframe.")
+    #
+    #     if n_min is None:
+    #         n_min = CONFIG["N_PROP_MIN"]
+    #     if n_max is None:
+    #         n_max = CONFIG["N_PROP_MAX"]
+    #     self._clear_simulation_results()
+    #
+    #     if GRN_unit is not None:
+    #         self.GRN_unit = GRN_unit
+    #     elif hasattr(self, "GRN_unit"):
+    #         GRN_unit = self.GRN_unit
+    #         #print("Currently selected GRN_unit: ", self.GRN_unit)
+    #     elif hasattr(self, "coef_matrix_per_cluster"):
+    #         GRN_unit = "cluster"
+    #         self.GRN_unit = GRN_unit
+    #     elif hasattr(self, "coef_matrix"):
+    #         GRN_unit = "whole"
+    #         self.GRN_unit = GRN_unit
+    #     else:
+    #         raise ValueError("GRN is not ready. Please run 'fit_GRN_for_simulation' first.")
+    #
+    #
+    #     # 1. prepare perturb information
+    #     self.perturb_condition = perturb_condition.copy()
+    #
+    #
+    #     # Prepare metadata before simulation
+    #     if not hasattr(self, "active_regulatory_genes"):
+    #         self.extract_active_gene_lists(verbose=False)
+    #
+    #     if not hasattr(self, "all_regulatory_genes_in_TFdict"):
+    #         self._process_TFdict_metadata()
+    #
+    #     for i, value in perturb_condition.items():
+    #         # 1st Sanity check
+    #         if not i in self.adata.var.index:
+    #             raise ValueError(f"Gene {i} is not included in the Gene expression matrix.")
+    #
+    #         # 2nd Sanity check
+    #         if i not in self.all_regulatory_genes_in_TFdict:
+    #             raise ValueError(f"Gene {i} is not included in the base GRN; It is not TF or TF motif information is not available. Cannot perform simulation.")
+    #
+    #         # 3rd Sanity check
+    #         if i not in self.active_regulatory_genes:
+    #             raise ValueError(f"Gene {i} does not have enough regulatory connection in the GRNs. Cannot perform simulation.")
+    #
+    #         # 4th Sanity check
+    #         if i not in self.high_var_genes:
+    #             if ignore_warning:
+    #                 pass
+    #                 #print(f"Variability score of Gene {i} is too low. Simulation accuracy may be poor with this gene.")
+    #             else:
+    #                 pass
+    #                 #print(f"Variability score of Gene {i} is too low. Simulation accuracy may be poor with this gene.")
+    #                 #raise ValueError(f"Variability score of Gene {i} is too low. Cannot perform simulation.")
+    #
+    #         # 5th Sanity check
+    #         if value < 0:
+    #             raise ValueError(f"Negative gene expression value is not allowed.")
+    #
+    #         # 6th Sanity check
+    #         safe = _is_perturb_condition_valid(adata=self.adata,
+    #                                     goi=i, value=value, safe_range_fold=2)
+    #         if not safe:
+    #             if ignore_warning:
+    #                 pass
+    #             else:
+    #                 raise ValueError(f"Input perturbation condition is far from actural gene expression value. Please follow the recommended usage. ")
+    #         # 7th QC
+    #         if n_min <= n_propagation <= n_max:
+    #             pass
+    #         else:
+    #             raise ValueError(f'n_propagation value error. It should be an integer from {n_min} to {n_max}.')
+    #
+    #     #To my current understanding, adata.layers["simulated_count"] is not used throughout the code only to reset and adjust based on perturb condition and convert directly to a dataframe (not necessary to store as global var)
+    #     #We will not use this as we receive a dataframe directly from the input to perturb.
+    #     # reset simulation initiation point
+    #     ############# OLD CODE ################
+    #     # self.adata.layers["simulation_input"] = self.adata.layers["imputed_count"].copy()
+    #     # simulation_input = _adata_to_df(self.adata, "simulation_input")
+    #     # for i in perturb_condition.keys():
+    #     #     simulation_input[i] = perturb_condition[i]
+    #     ############# OLD CODE ################
+    #
+    #     # 2. load gene expression matrix (initiation information for the simulation)
+    #     #retrieving the original data is again not necessary as we only want to operate on a single cell state
+    #
+    #     ############# OLD CODE ################
+    #     # gem_imputed = _adata_to_df(self.adata, "imputed_count")
+    #     # simulated = []
+    #     # cluster_info = self.adata.obs[self.cluster_column_name]
+    #     ############# OLD CODE ################
+    #
+    #     ############# NEW CODE ################
+    #     gem_imputed = cell_state.copy()
+    #     simulation_input = cell_state.copy()
+    #     for i in perturb_condition.keys():
+    #         simulation_input[i] = perturb_condition[i]
+    #     ############# NEW CODE ################
+    #
+    #
+    #
+    #     if self.coef_matrix_per_cluster.__contains__(GRN_cluster)==False:
+    #         raise ValueError(f"GRN cluster {GRN_cluster} does not exist. Please run 'fit_GRN_for_simulation' first.")
+    #
+    #     cluster_specific_coef_matrix =  self.coef_matrix_per_cluster[GRN_cluster].copy()
+    #     #code that convert gem_imputed and simulation_input to a shape of 1, n_genes if the shape is n_genes,
+    #     if gem_imputed.shape != (1,cluster_specific_coef_matrix.shape[0]):
+    #         gem_imputed = gem_imputed.reshape(1,-1)
+    #     if simulation_input.shape != (1,cluster_specific_coef_matrix.shape[0]):
+    #         simulation_input = simulation_input.reshape(1,-1)
+    #     #make sure its 1,n_genes shape both simulated and gem as it is necessary to correctly perform the _do_simulation function
+    #     gem_simulated = _do_simulation(coef_matrix=cluster_specific_coef_matrix,simulation_input=simulation_input,gem=gem_imputed,n_propagation=n_propagation)
+    #
+    #     ############# OLD CODE ################
+    #     # for cluster in np.unique(cluster_info):
+    #     #     coef_matrix = self.coef_matrix_per_cluster[cluster].copy()
+    #     #     cells_in_the_cluster_bool = (cluster_info == cluster)
+    #     #     simulation_input_ = simulation_input[cells_in_the_cluster_bool]
+    #     #     gem_ = gem_imputed[cells_in_the_cluster_bool]
+    #     #     simulated.append(simulated_in_the_cluster)
+    #     # gem_simulated = pd.concat(simulated, axis=0)
+    #     # gem_simulated = gem_simulated.reindex(gem_imputed.index)
+    #     ############# OLD CODE ################
+    #
+    #
+    #
+    #
+    #     # 4. store simulation results
+    #     #  simulated future gene expression matrix
+    #     self.adata.layers["simulated_count"] = gem_simulated.values
+    #
+    #     if(self.save_simulated_counts_single ==None):
+    #         self.save_simulated_counts_single = []
+    #
+    #     simulated_frame_with_perturb_dict = (gem_simulated.values, perturb_condition.copy())
+    #     self.save_simulated_counts_single.append(simulated_frame_with_perturb_dict)
+    #
+    #
+    #     #  difference between simulated values and original values
+    #     self.adata.layers["delta_X"] = self.adata.layers["simulated_count"] - self.adata.layers["imputed_count"]
+    #
+    #     # Clip simulated gene expression to avoid out of distribution prediction.
+    #     if clip_delta_X:
+    #         self.clip_delta_X()
+    #
+    #     # Sanity check; check distribution of simulated values. If the value is far from original gene expression range, it will give warning.
+    #     if ignore_warning:
+    #         pass
+    #     else:
+    #         ood_stat = self.evaluate_simulated_gene_distribution_range()
+    #         ood_stat = ood_stat[ood_stat.Max_exceeding_ratio > CONFIG["OOD_WARNING_EXCEEDING_PERCENTAGE"]/100]
+    #         if len(ood_stat)> 0:
+    #             message = f"There may be out of distribution prediction in {len(ood_stat)} genes. It is recommended to set `clip_delta_X=True` to avoid the out of distribution prediction."
+    #             message += "\n To see the detail, please run `oracle.evaluate_simulated_gene_distribution_range()`"
+    #             warnings.warn(message, UserWarning, stacklevel=2)
 
 
     def _clear_simulation_results(self):
@@ -1237,6 +1482,17 @@ class Oracle(modified_VelocytoLoom, Oracle_visualization):
         self.adata.layers["simulated_count"] = simulated_count.values
         self.adata.layers["delta_X"] = self.adata.layers["simulated_count"] - self.adata.layers["imputed_count"]
 
+    def clip_delta_X_subset(self, simulated_count, imputed_count):
+        """
+        To avoid issue caused by out-of-distribution prediction, this function clip simulated gene expression value to the unperturbed gene expression range.
+        """
+        min_ = imputed_count.min(axis=0)
+        max_ = imputed_count.max(axis=0)
+
+        for goi in simulated_count.columns:
+            simulated_count[goi] = np.clip(simulated_count[goi], min_[goi], max_[goi])
+
+        return simulated_count
 
 
     def estimate_impact_of_perturbations_under_various_ns(self, perturb_condition, order=1, n_prop_max=5, GRN_unit=None, figsize=[7, 3]):
